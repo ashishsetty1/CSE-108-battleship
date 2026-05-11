@@ -1,9 +1,10 @@
 import { useState, useEffect, useMemo } from "react";
 import { io } from "socket.io-client";
 
-const socket = io("http://127.0.0.1:5000", {
-  transports: ["websocket", "polling"],
+const socket = io("https://cse-108-battleship-backend.onrender.com", {
+  transports: ["websocket"],
 });
+
 
 const SHIPS = [
   { name: "Carrier", size: 5 },
