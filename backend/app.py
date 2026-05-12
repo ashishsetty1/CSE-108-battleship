@@ -1,14 +1,30 @@
-from flask import Flask
-from flask_socketio import SocketIO, join_room, emit
+from flask import Flask, request, jsonify
+from flask_socketio import SocketIO, join_room, leave_room, emit
 from flask_cors import CORS
+from flask_jwt_extended import JWTManager, create_access_token
+from sqlmodel import create_engine, Session, select, SQLModel
+from werkzeug.security import generate_password_hash, check_password_hash
+from models import User, UserFriendLink, Match  # noqa: F401 – UserFriendLink registers its table
 import random
 import string
+import os
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "battleship-secret"
+app.config["JWT_SECRET_KEY"] = os.environ.get(
+    "JWT_SECRET_KEY", "battleship-jwt-secret-change-in-prod"
+)
 
 CORS(app)
+jwt = JWTManager(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+
+engine = create_engine("sqlite:///battleship.db")
+SQLModel.metadata.create_all(engine)
+
+# ---------------------------------------------------------------------------
+# Game constants & in-memory state
+# ---------------------------------------------------------------------------
 
 SHIPS = {
     "Carrier": 5,
@@ -19,7 +35,92 @@ SHIPS = {
 }
 
 games = {}
+player_rooms = {}  # username -> room_code (enforces one game per user)
+sid_to_name = {}   # socket sid -> username (for disconnect cleanup)
 
+# ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
+
+@app.route("/api/signup", methods=["POST"])
+def signup():
+    data = request.get_json() or {}
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+
+    with Session(engine) as session:
+        if session.exec(select(User).where(User.username == username)).first():
+            return jsonify({"error": "Username already taken"}), 409
+
+        user = User(
+            username=username,
+            password_hash=generate_password_hash(password),
+        )
+        session.add(user)
+        session.commit()
+
+    token = create_access_token(identity=username)
+    return jsonify({"token": token, "username": username}), 201
+
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.get_json() or {}
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+
+    with Session(engine) as session:
+        user = session.exec(select(User).where(User.username == username)).first()
+
+    if not user or not check_password_hash(user.password_hash, password):
+        return jsonify({"error": "Invalid username or password"}), 401
+
+    token = create_access_token(identity=username)
+    return jsonify({"token": token, "username": username}), 200
+
+
+# ---------------------------------------------------------------------------
+# Profile route
+# ---------------------------------------------------------------------------
+
+@app.route("/api/profile/<username>", methods=["GET"])
+def get_profile(username):
+    with Session(engine) as session:
+        user = session.exec(select(User).where(User.username == username)).first()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        as_p1 = session.exec(select(Match).where(Match.player1 == username)).all()
+        as_p2 = session.exec(select(Match).where(Match.player2 == username)).all()
+        all_matches = sorted(as_p1 + as_p2, key=lambda m: m.id, reverse=True)
+
+        history = []
+        for m in all_matches:
+            opponent = m.player2 if m.player1 == username else m.player1
+            history.append({
+                "opponent": opponent,
+                "result": "win" if m.winner == username else "loss",
+                "played_at": m.played_at,
+            })
+
+        return jsonify({
+            "username": user.username,
+            "wins": user.wins,
+            "losses": user.losses,
+            "total_match_count": user.total_match_count,
+            "match_history": history,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
 
 @app.route("/")
 def home():
@@ -59,7 +160,6 @@ def is_valid_manual_ship(existing_cells, ship_cells, required_size):
     for row, col in normalized:
         if row < 0 or row >= 10 or col < 0 or col >= 10:
             return False, "Ship is outside the board."
-
         if (row, col) in existing_cells:
             return False, "Ship overlaps another ship."
 
@@ -82,14 +182,50 @@ def is_valid_manual_ship(existing_cells, ship_cells, required_size):
     return True, "Valid placement."
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _remove_player_from_room(name, room_code):
+    """Remove a player from a game, clean up state, and notify remaining player."""
+    if room_code not in games:
+        player_rooms.pop(name, None)
+        return
+
+    game = games[room_code]
+
+    if name in game["players"]:
+        if len(game["players"]) == 1:
+            del games[room_code]
+        else:
+            socketio.emit("player_left", {"player": name}, room=room_code)
+            game["players"] = [p for p in game["players"] if p != name]
+            for key in ["boards", "ships", "ships_placed", "sunk_ships", "attacks", "stats"]:
+                if key in game and isinstance(game[key], dict):
+                    game[key].pop(name, None)
+            game.get("ready", {}).pop(name, None)
+            game["status"] = "abandoned"
+
+    player_rooms.pop(name, None)
+
+
+# ---------------------------------------------------------------------------
+# Socket.IO events
+# ---------------------------------------------------------------------------
+
 @socketio.on("connect")
 def handle_connect():
-    print("Client connected")
+    print(f"Client connected: {request.sid}")
 
 
 @socketio.on("disconnect")
 def handle_disconnect():
-    print("Client disconnected")
+    sid = request.sid
+    name = sid_to_name.pop(sid, None)
+    if name and name in player_rooms:
+        room_code = player_rooms[name]
+        _remove_player_from_room(name, room_code)
+    print(f"Client disconnected: {name or 'unknown'}")
 
 
 @socketio.on("create_game")
@@ -100,12 +236,19 @@ def create_game(data):
         emit("error_message", {"message": "Name is required"})
         return
 
-    room_code = generate_room_code()
+    # Leave any existing room first
+    if name in player_rooms:
+        old_room = player_rooms[name]
+        leave_room(old_room)
+        _remove_player_from_room(name, old_room)
 
+    room_code = generate_room_code()
     games[room_code] = {
         "players": [name],
         **empty_player_state([name]),
     }
+    player_rooms[name] = room_code
+    sid_to_name[request.sid] = name
 
     join_room(room_code)
 
@@ -129,14 +272,25 @@ def join_game(data):
         emit("error_message", {"message": "Invalid room code"})
         return
 
+    if name in games[room_code]["players"]:
+        emit("error_message", {"message": "You are already in this room"})
+        return
+
     if len(games[room_code]["players"]) >= 2:
         emit("error_message", {"message": "Room is full"})
         return
 
-    games[room_code]["players"].append(name)
+    # Leave any other room this player is currently in
+    if name in player_rooms:
+        old_room = player_rooms[name]
+        leave_room(old_room)
+        _remove_player_from_room(name, old_room)
 
+    games[room_code]["players"].append(name)
     players = games[room_code]["players"]
     games[room_code].update(empty_player_state(players))
+    player_rooms[name] = room_code
+    sid_to_name[request.sid] = name
 
     join_room(room_code)
 
@@ -145,6 +299,23 @@ def join_game(data):
         "players": players,
         "turn": games[room_code]["turn"],
     }, room=room_code)
+
+
+@socketio.on("leave_game")
+def leave_game(data):
+    name = data.get("name", "").strip()
+    room_code = data.get("room_code", "").strip()
+
+    if not name:
+        return
+
+    if room_code in games:
+        leave_room(room_code)
+        _remove_player_from_room(name, room_code)
+    else:
+        player_rooms.pop(name, None)
+
+    sid_to_name.pop(request.sid, None)
 
 
 @socketio.on("place_ship")
@@ -176,15 +347,11 @@ def place_ship(data):
         return
 
     ship_cells = [tuple(cell) for cell in cells]
-
     game["boards"][player].extend(ship_cells)
     game["ships"][player][ship_name] = ship_cells
     game["ships_placed"][player].append(ship_name)
 
-    emit("ship_placed", {
-        "ship_name": ship_name,
-        "cells": ship_cells,
-    })
+    emit("ship_placed", {"ship_name": ship_name, "cells": ship_cells})
 
 
 @socketio.on("finish_placement")
@@ -203,7 +370,6 @@ def finish_placement(data):
         return
 
     game["ready"][player] = True
-
     emit("placement_finished", {"player": player}, room=room_code)
 
     if len(game["ready"]) == 2:
@@ -249,7 +415,6 @@ def handle_attack(data):
     result = "hit" if (row, col) in opponent_ship_cells else "miss"
 
     game["stats"][player]["shots"] += 1
-
     if result == "hit":
         game["stats"][player]["hits"] += 1
     else:
@@ -260,7 +425,6 @@ def handle_attack(data):
     game["stats"][player]["accuracy"] = round((hits / shots) * 100) if shots else 0
 
     sunk_ship = None
-
     attacker_hits = set(
         tuple(attack)
         for attack in game["attacks"][player]
@@ -270,7 +434,6 @@ def handle_attack(data):
     if result == "hit":
         for ship_name, ship_cells in game["ships"][opponent].items():
             ship_cell_set = set(tuple(cell) for cell in ship_cells)
-
             if (
                 ship_cell_set.issubset(attacker_hits)
                 and ship_name not in game["sunk_ships"][opponent]
@@ -289,6 +452,17 @@ def handle_attack(data):
         winner = player
         game_over = True
         game["status"] = "game_over"
+
+        loser = [p for p in game["players"] if p != winner][0]
+        with Session(engine) as session:
+            session.add(Match(player1=game["players"][0], player2=game["players"][1], winner=winner))
+            for uname, field in [(winner, "wins"), (loser, "losses")]:
+                u = session.exec(select(User).where(User.username == uname)).first()
+                if u:
+                    setattr(u, field, getattr(u, field) + 1)
+                    u.total_match_count += 1
+                    session.add(u)
+            session.commit()
     else:
         game["turn"] = 1 - game["turn"]
 

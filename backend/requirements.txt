@@ -2,3 +2,6 @@ flask
 flask-socketio
 eventlet
 flask-cors
+sqlmodel
+werkzeug
+flask-jwt-extended
